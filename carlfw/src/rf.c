@@ -235,8 +235,22 @@ void rf_cmd(const struct carl9170_cmd *cmd, struct carl9170_rsp *resp)
 
 void rf_psm(void)
 {
-	u32 bank3;
 
+	/*
+	 * PSM disabled — powering down ADDAC/synthesizer causes the
+	 * SH-2 to miss USB command responses, triggering host-side
+	 * -ETIMEDOUT and device crash. Always stay awake.
+	 */
+	return;
+
+#if 0
+	/*
+	 * Upstream PSM implementation preserved for reference.
+	 * Dead code — unreachable after the early return above.
+	 * Retained so the full upstream logic remains visible
+	 * should PSM ever be re-enabled.
+	 */
+	u32 bank3;
 	if (fw.phy.psm.state == CARL9170_PSM_SOFTWARE) {
 		/* not enabled by the driver */
 		return;
@@ -284,6 +298,7 @@ void rf_psm(void)
 		bank3 |= 0x00800000;
 
 	set(0x1c58f0, bank3);
+#endif /* #if 0 -- upstream PSM, see early return above */
 }
 
 #endif /* CONFIG_CARL9170FW_RADIO_FUNCTIONS */
