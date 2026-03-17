@@ -237,6 +237,13 @@ void rf_psm(void)
 {
 	u32 bank3;
 
+	/*
+	 * PSM disabled — powering down ADDAC/synthesizer causes the
+	 * SH-2 to miss USB command responses, triggering host-side
+	 * -ETIMEDOUT and device crash. Always stay awake.
+	 */
+	return;
+
 	if (fw.phy.psm.state == CARL9170_PSM_SOFTWARE) {
 		/* not enabled by the driver */
 		return;
