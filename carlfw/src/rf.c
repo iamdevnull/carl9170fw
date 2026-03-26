@@ -26,6 +26,7 @@
 #include "timer.h"
 #include "printf.h"
 #include "rf.h"
+#include "hostif.h"
 #include "shared/phy.h"
 
 #ifdef CONFIG_CARL9170FW_RADIO_FUNCTIONS
@@ -42,6 +43,9 @@ static void set_channel_end(void)
 
 void rf_notify_set_channel(void)
 {
+	struct dma_desc *desc;
+	unsigned int i;
+
 	/* Manipulate CCA threshold to stop transmission */
 	set(AR9170_PHY_REG_CCA_THRESHOLD, 0x300);
 	/* Enable Virtual CCA */
@@ -53,6 +57,59 @@ void rf_notify_set_channel(void)
 	fw.tally.cca = 0;
 	fw.tally.tx_time = 0;
 	fw.phy.state = CARL9170_PHY_OFF;
+
+	/*
+	 * Roam/channel-change state reset.
+	 *
+	 * The firmware has no reassociation concept. After a channel
+	 * change (roam or scan), pre-roam TX sequence numbers cause
+	 * the new AP to drop frames as duplicates, stale BA cache
+	 * entries generate BlockACK responses to the old AP, and
+	 * AMPDU chaining state is undefined.
+	 *
+	 * Zero all per-VIF TX sequence counters so the next transmitted
+	 * frame starts a fresh sequence number space from the new AP's
+	 * perspective.
+	 */
+	memset(fw.wlan.sequence, 0, sizeof(fw.wlan.sequence));
+
+	/*
+	 * Clear BlockACK cache. queued_ba is the count of pending BA
+	 * responses; head/tail track the ring buffer. After a channel
+	 * change none of the cached BA state is valid for the new AP.
+	 */
+	memset(fw.wlan.ba_cache, 0, sizeof(fw.wlan.ba_cache));
+	fw.wlan.queued_ba = 0;
+	fw.wlan.ba_tail_idx = 0;
+	fw.wlan.ba_head_idx = 0;
+
+	/*
+	 * Clear per-queue AMPDU chaining pointers. ampdu_prev tracks
+	 * the last AMPDU superframe to chain ba_end markers. After a
+	 * channel change the chain is broken regardless.
+	 */
+	for (i = 0; i < __AR9170_NUM_TX_QUEUES; i++)
+		fw.wlan.ampdu_prev[i] = NULL;
+
+	/*
+	 * Drain the TX retry queue. Frames sitting in tx_retry were
+	 * awaiting retransmission to the old AP — they are stale after
+	 * a channel change and must not be replayed to the new AP.
+	 * Recycle the descriptors back to the host download queue so
+	 * the host can free them.
+	 *
+	 * Iteration safety: for_each_desc() expands to
+	 *   while ((desc = dma_unlink_head(queue)))
+	 * dma_unlink_head() removes and returns the head descriptor
+	 * before the loop body runs. dma_reclaim() operates on the
+	 * already-removed desc, so modifying tx_retry during iteration
+	 * is safe — the next call to dma_unlink_head() sees the
+	 * updated head.
+	 */
+	for_each_desc(desc, &fw.wlan.tx_retry) {
+		dma_reclaim(&fw.pta.down_queue, desc);
+	}
+	down_trigger();
 }
 
 /*
