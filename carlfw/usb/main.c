@@ -60,44 +60,96 @@ void usb_print_hex_dump(const void *buf, int len)
 }
 #endif /* CONFIG_CARL9170FW_DEBUG_USB */
 
-/* grab a buffer from the interrupt in queue ring-buffer */
-static struct carl9170_rsp *get_int_buf(void)
+/*
+ * Command response buffer (slots 0..CMD_RESERVED-1).
+ * Reserved exclusively for handle_cmd() responses to prevent
+ * async event floods from starving command completions.
+ */
+static struct carl9170_rsp *get_cmd_buf(void)
 {
 	struct carl9170_rsp *tmp;
+	unsigned int idx;
 
-	/* fetch the _oldest_ buffer from the ring */
-	tmp = &fw.usb.int_buf[fw.usb.int_tail_index];
+	if (fw.usb.cmd_pending >= CARL9170_INT_CMD_RESERVED) {
+		fw.usb.cmd_overflow++;
+		return NULL;
+	}
 
-	/* assign a unique sequence for every response/trap */
-	tmp->hdr.seq = fw.usb.int_tail_index;
+	idx = fw.usb.cmd_tail_index;
+	tmp = &fw.usb.int_buf[idx];
+	tmp->hdr.seq = fw.usb.int_seq_counter++ % CARL9170_INT_RQ_CACHES;
 
-	fw.usb.int_tail_index++;
-
-	fw.usb.int_tail_index %= CARL9170_INT_RQ_CACHES;
-	if (fw.usb.int_pending != CARL9170_INT_RQ_CACHES)
-		fw.usb.int_pending++;
+	fw.usb.cmd_tail_index++;
+	if (fw.usb.cmd_tail_index >= CARL9170_INT_CMD_RESERVED)
+		fw.usb.cmd_tail_index = 0;
+	fw.usb.cmd_pending++;
 
 	return tmp;
 }
 
-/* Pop up data from Interrupt IN Queue to USB Response buffer */
+/*
+ * Async event buffer (slots CMD_RESERVED..INT_RQ_CACHES-1).
+ * Used by send_cmd_to_host() for TX status, beacon, and other
+ * asynchronous notifications.
+ */
+static struct carl9170_rsp *get_int_buf(void)
+{
+	struct carl9170_rsp *tmp;
+	unsigned int idx;
+
+	if (fw.usb.int_pending >= CARL9170_INT_ASYNC_CACHES)
+		return NULL;
+
+	idx = CARL9170_INT_CMD_RESERVED + fw.usb.int_tail_index;
+	tmp = &fw.usb.int_buf[idx];
+	tmp->hdr.seq = fw.usb.int_seq_counter++ % CARL9170_INT_RQ_CACHES;
+
+	fw.usb.int_tail_index++;
+	if (fw.usb.int_tail_index >= CARL9170_INT_ASYNC_CACHES)
+		fw.usb.int_tail_index = 0;
+	fw.usb.int_pending++;
+
+	return tmp;
+}
+
+/* Dequeue from command response pool first, then async pool */
 static struct carl9170_rsp *dequeue_int_buf(unsigned int space)
 {
-	struct carl9170_rsp *tmp = NULL;
+	struct carl9170_rsp *tmp;
 
+	/* command responses have priority */
+	if (fw.usb.cmd_pending > 0) {
+		tmp = &fw.usb.int_buf[fw.usb.cmd_head_index];
+
+		if ((unsigned int)(tmp->hdr.len + 8) > space)
+			return NULL;
+
+		fw.usb.cmd_head_index++;
+		if (fw.usb.cmd_head_index >= CARL9170_INT_CMD_RESERVED)
+			fw.usb.cmd_head_index = 0;
+		fw.usb.cmd_pending--;
+		return tmp;
+	}
+
+	/* then async events */
 	if (fw.usb.int_pending > 0) {
-		tmp = &fw.usb.int_buf[fw.usb.int_head_index];
+		tmp = &fw.usb.int_buf[CARL9170_INT_CMD_RESERVED +
+				      fw.usb.int_head_index];
 
 		if ((unsigned int)(tmp->hdr.len + 8) > space)
 			return NULL;
 
 		fw.usb.int_head_index++;
-		fw.usb.int_head_index %= CARL9170_INT_RQ_CACHES;
+		if (fw.usb.int_head_index >= CARL9170_INT_ASYNC_CACHES)
+			fw.usb.int_head_index = 0;
 		fw.usb.int_pending--;
+		return tmp;
 	}
 
-	return tmp;
+	return NULL;
 }
+
+static void usb_status_in(void);
 
 static void usb_data_in(void)
 {
@@ -121,7 +173,22 @@ static void usb_reg_out(void)
 	for (i = 0; i < usbfifolen; i++)
 		*regaddr++ = get(AR9170_USB_REG_EP4_DATA);
 
-	handle_cmd(get_int_buf());
+	/*
+	 * Flush pending responses before processing new command.
+	 * This ensures the USB descriptor is freed for the command
+	 * response, preventing descriptor starvation when async
+	 * events have accumulated.
+	 */
+	if ((fw.usb.cmd_pending || fw.usb.int_pending) &&
+	    fw.usb.int_desc_available)
+		usb_status_in();
+
+	{
+		struct carl9170_rsp *resp = get_cmd_buf();
+
+		if (likely(resp != NULL))
+			handle_cmd(resp);
+	}
 
 	usb_trigger_in();
 }
@@ -141,7 +208,7 @@ static void usb_status_in(void)
 
 	usb_reset_in();
 
-	while (fw.usb.int_pending) {
+	while (fw.usb.cmd_pending || fw.usb.int_pending) {
 		rsp = dequeue_int_buf(rem);
 		if (!rsp)
 			break;
@@ -480,7 +547,7 @@ void handle_usb(void)
 	if (usb_interrupt_level1)
 		usb_handler(usb_interrupt_level1);
 
-	if (fw.usb.int_pending > 0)
+	if (fw.usb.cmd_pending > 0 || fw.usb.int_pending > 0)
 		usb_trigger_in();
 }
 
